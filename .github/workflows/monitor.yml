@@ -2,15 +2,17 @@ name: Zxmoto 500RR Monitor
 
 on:
   schedule:
-    # Cada 15 minutos — GitHub puede retrasarlo pero es lo mas frecuente que permite
     - cron: '*/15 * * * *'
-  # Permite lanzarlo manualmente desde github.com/jvelles/zxmoto-monitor/actions
   workflow_dispatch:
 
 jobs:
   check-zxmoto:
     name: Comprobar zxmoto.es
     runs-on: ubuntu-latest
+    # Permiso para que el script pueda escribir state.json en el repo
+    permissions:
+      contents: write
+
     steps:
       - name: Descargar codigo
         uses: actions/checkout@v4
@@ -23,6 +25,7 @@ jobs:
       - name: Ejecutar monitor
         run: node checker-cloud.js
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          # HEARTBEAT ya no depende de esta variable — el script lo calcula por hora UTC
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:   ${{ github.repository }}
