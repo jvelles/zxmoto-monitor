@@ -1,11 +1,16 @@
-// checker-cloud.js
-// Monitor Zxmoto 500RR — con heartbeat cada 2h
-// Sin dependencias externas, corre en GitHub Actions
+// checker-cloud.js v3
+// Monitor Zxmoto 500RR — heartbeat basado en hora real, no en variable de entorno
 
-const TARGET_URL      = 'https://zxmoto.es/';
-const TELEGRAM_TOKEN  = process.env.TELEGRAM_BOT_TOKEN;
+const TARGET_URL       = 'https://zxmoto.es/';
+const TELEGRAM_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const IS_HEARTBEAT    = process.env.HEARTBEAT === 'true';
+
+// Heartbeat: se envía si estamos en los primeros 25 minutos de una hora par UTC
+// (cubre retrasos habituales de GitHub Actions)
+const utcNow  = new Date();
+const utcH    = utcNow.getUTCHours();
+const utcM    = utcNow.getUTCMinutes();
+const IS_HEARTBEAT = (utcH % 2 === 0) && (utcM <= 25);
 
 async function fetchPage(url) {
   const res = await fetch(url, {
@@ -38,7 +43,7 @@ function analyzeHTML(html, mainText) {
   const signals   = [];
   const closedKws = [];
 
-  // 1. Formularios con campos de pago reales
+  // 1. Formularios con campos de pago reales (no scripts externos)
   const forms = [...html.matchAll(/<form[\s\S]*?<\/form>/gi)].map(m => m[0].toLowerCase());
   for (const form of forms) {
     if (form.includes('card') || form.includes('cvv') || form.includes('iban') ||
@@ -48,7 +53,7 @@ function analyzeHTML(html, mainText) {
     }
   }
 
-  // 2. Iframes de pasarela de pago
+  // 2. Iframes de pasarela de pago embebida
   const iframes = [...html.matchAll(/<iframe[^>]*>/gi)].map(m => m[0]);
   for (const iframe of iframes) {
     const src = (iframe.match(/src=["']([^"']*)/i)?.[1] || '').toLowerCase();
@@ -59,7 +64,7 @@ function analyzeHTML(html, mainText) {
     }
   }
 
-  // 3. Texto de reserva en el cuerpo (nav ya eliminado)
+  // 3. Texto de reserva/compra en el cuerpo (nav ya eliminado)
   const reservaKws = [
     'reservar ahora', 'hacer reserva', 'realizar reserva', 'reservar ya',
     'comprar ahora', 'anadir al carrito', 'add to cart', 'pedir ahora',
@@ -71,21 +76,23 @@ function analyzeHTML(html, mainText) {
 
   // 4. Precios reales en euros (> 500 EUR)
   const priceMatches = mainText.match(/\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*€/g) || [];
-  const realPrices = priceMatches.filter(p => parseFloat(p.replace(/[€.,\s]/g, '').replace(',', '.')) > 500);
+  const realPrices = priceMatches.filter(p =>
+    parseFloat(p.replace(/[€.,\s]/g, '').replace(',', '.')) > 500
+  );
   if (realPrices.length > 0) signals.push(`Precios detectados: ${realPrices.slice(0, 3).join(', ')}`);
 
-  // 5. Links a tienda/reserva
+  // 5. Links a tienda/reserva en el HTML
   const shopHrefKws = ['/reserv', '/comprar', '/tienda', '/shop', '/cart', '/checkout', '/pedido'];
   const linkMatches = [...html.matchAll(/href=["']([^"']*)/gi)].map(m => m[1].toLowerCase());
   for (const href of linkMatches) {
     if (shopHrefKws.some(kw => href.includes(kw))) { signals.push(`Link tienda: ${href}`); break; }
   }
 
-  // 6. Indicadores de cierre
+  // 6. Indicadores de que sigue cerrado
   const closedList = [
-    'proximamente', 'proximo', 'coming soon', 'en breve', 'stay tuned',
-    'pronto disponible', 'available soon', 'launching soon', 'abriremos',
-    'mantente informado', 'registro de interes',
+    'proximamente', 'coming soon', 'en breve', 'stay tuned',
+    'pronto disponible', 'available soon', 'launching soon',
+    'abriremos', 'mantente informado', 'registro de interes',
   ];
   for (const kw of closedList) { if (mainText.includes(kw)) closedKws.push(kw); }
 
@@ -95,10 +102,7 @@ function analyzeHTML(html, mainText) {
 }
 
 async function sendTelegram(text) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.log('Sin credenciales Telegram.');
-    return;
-  }
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) { console.log('Sin credenciales Telegram.'); return; }
   const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -110,9 +114,10 @@ async function sendTelegram(text) {
 }
 
 async function main() {
-  const now = new Date().toLocaleString('es-ES', { timeZone: 'Europe/Madrid' });
-  console.log(`\nZxmoto 500RR Monitor — ${now}`);
-  console.log(`Heartbeat: ${IS_HEARTBEAT}`);
+  const now    = new Date().toLocaleString('es-ES', { timeZone: 'Europe/Madrid' });
+  const nowUTC = `${utcH}:${String(utcM).padStart(2,'0')} UTC`;
+  console.log(`\nZxmoto 500RR Monitor — ${now} (${nowUTC})`);
+  console.log(`Heartbeat: ${IS_HEARTBEAT} (hora UTC ${utcH} es ${utcH%2===0?'par':'impar'}, minuto ${utcM})`);
   console.log(`Comprobando: ${TARGET_URL}\n`);
 
   let html, mainText;
@@ -124,50 +129,52 @@ async function main() {
     if (IS_HEARTBEAT) {
       await sendTelegram(
         `⚠️ <b>Zxmoto Monitor — Error de conexion</b>\n\n` +
-        `No se pudo acceder a zxmoto.es en el check de las ${now}\n` +
+        `No se pudo acceder a zxmoto.es\n` +
         `Error: ${err.message}\n\n` +
-        `Se seguira intentando cada 15 minutos.`
+        `Se seguira intentando. ⏰ ${now}`
       );
     }
     process.exit(0);
   }
 
   const result = analyzeHTML(html, mainText);
-  console.log(`Senales de apertura: ${result.signals.length}`);
+  console.log(`Senales de apertura  : ${result.signals.length}`);
   console.log(`Indicadores de cierre: ${result.closedKws.length}`);
-  if (result.signals.length > 0) result.signals.forEach(s => console.log(`  + ${s}`));
-  if (result.closedKws.length > 0) console.log(`  Cierre: ${result.closedKws.join(', ')}`);
+  if (result.signals.length  > 0) result.signals.forEach(s => console.log(`  + ${s}`));
+  if (result.closedKws.length > 0) console.log(`  Cerrado: ${result.closedKws.join(', ')}`);
 
   if (result.isOpen) {
     // ─── ALERTA REAL ─────────────────────────────────────────────────────────
     console.log('\nSENALES DE APERTURA DETECTADAS\n');
     const signalList = result.signals.map(s => `• ${s}`).join('\n');
     await sendTelegram(
-      `🏍️ <b>ZXMOTO 500RR — ¡RESERVAS POSIBLEMENTE ABIERTAS!</b>\n\n` +
+      `🏍️ <b>ZXMOTO 500RR — RESERVAS ABIERTAS!</b>\n\n` +
       `Senales detectadas:\n${signalList}\n\n` +
-      `🔗 <a href="https://zxmoto.es/">👉 VE A ZXMOTO.ES AHORA</a>\n\n` +
-      `⏰ ${now}`
+      `🔗 <a href="https://zxmoto.es/">VE A ZXMOTO.ES AHORA</a>\n\n` +
+      `Detectado: ${now}`
     );
+
   } else if (result.isPossible) {
-    console.log('\nSenales mixtas — revision manual recomendada');
+    console.log('\nSenales mixtas — posible cambio parcial');
     await sendTelegram(
       `⚠️ <b>Zxmoto 500RR — Cambio detectado (revisar)</b>\n\n` +
       `Senales: ${result.signals.join(', ')}\n` +
-      `Pero sigue indicando: ${result.closedKws.join(', ')}\n\n` +
-      `🔗 <a href="https://zxmoto.es/">zxmoto.es</a>\n\n` +
-      `⏰ ${now}`
+      `Pero sigue con: ${result.closedKws.join(', ')}\n\n` +
+      `🔗 <a href="https://zxmoto.es/">zxmoto.es</a>\n\n${now}`
     );
+
   } else {
-    // Sin reservas — solo enviar Telegram si es el heartbeat de cada 2h
-    console.log('\nEstado: SIN RESERVAS todavia.');
+    // Sin reservas — enviar Telegram solo si es heartbeat
+    console.log('\nEstado: SIN RESERVAS todavia. Normal.');
     if (IS_HEARTBEAT) {
+      console.log('-> Enviando heartbeat (hora UTC par)');
       await sendTelegram(
         `🏍️ <b>Zxmoto Monitor — Todo OK</b>\n\n` +
-        `✅ Sigo vigilando zxmoto.es cada 15 minutos.\n` +
-        `📋 Estado actual: <b>Sin reservas todavia</b>\n` +
-        `🔒 La web sigue en modo "proximamente"\n\n` +
-        `Te avisare en cuanto haya algo. Sigue esperando 💪\n\n` +
-        `⏰ Ultimo check: ${now}`
+        `✅ Sigo vigilando zxmoto.es\n` +
+        `📋 Estado: <b>Sin reservas todavia</b>\n` +
+        `🔒 La web sigue en modo proximamente\n\n` +
+        `Te aviso en cuanto haya algo 💪\n\n` +
+        `⏰ ${now}`
       );
     }
   }
