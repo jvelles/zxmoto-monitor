@@ -2,7 +2,8 @@ name: Zxmoto 500RR Monitor
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/15 * * * *'   # Comprueba reservas cada 15 minutos
+    - cron: '0 */2 * * *'    # Heartbeat cada 2 horas (aviso "sigo activo")
   workflow_dispatch:
 
 jobs:
@@ -21,3 +22,4 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          HEARTBEAT: ${{ github.event.schedule == '0 */2 * * *' && 'true' || 'false' }}
