@@ -1,17 +1,76 @@
-// checker-cloud.js v3
-// Monitor Zxmoto 500RR — heartbeat basado en hora real, no en variable de entorno
+// checker-cloud.js v4
+// Monitor Zxmoto 500RR
+// Heartbeat fiable: guarda el timestamp del último aviso en state.json del repo.
+// Si han pasado >2h desde el último heartbeat → lo manda, sin depender de qué cron disparó GitHub.
 
 const TARGET_URL       = 'https://zxmoto.es/';
 const TELEGRAM_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const GITHUB_TOKEN     = process.env.GITHUB_TOKEN;       // Automático en GitHub Actions
+const GITHUB_REPO      = process.env.GITHUB_REPOSITORY; // Ej: jvelles/zxmoto-monitor
 
-// Heartbeat: se envía si estamos en los primeros 25 minutos de una hora par UTC
-// (cubre retrasos habituales de GitHub Actions)
-const utcNow  = new Date();
-const utcH    = utcNow.getUTCHours();
-const utcM    = utcNow.getUTCMinutes();
-const IS_HEARTBEAT = (utcH % 2 === 0) && (utcM <= 25);
+const HEARTBEAT_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 horas
 
+// ─── Telegram ─────────────────────────────────────────────────────────────────
+async function sendTelegram(text) {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) { console.log('Sin credenciales Telegram.'); return false; }
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' }),
+  });
+  const json = await res.json();
+  if (json.ok) { console.log('Telegram OK'); return true; }
+  console.error('Error Telegram:', json.description);
+  return false;
+}
+
+// ─── Estado (state.json en el repo) ──────────────────────────────────────────
+async function readState() {
+  try {
+    const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/state.json?t=${Date.now()}`;
+    const res  = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return { lastHeartbeat: 0 };
+    return await res.json();
+  } catch {
+    return { lastHeartbeat: 0 };
+  }
+}
+
+async function writeState(state) {
+  if (!GITHUB_TOKEN || !GITHUB_REPO) { console.log('Sin GITHUB_TOKEN para escribir estado.'); return; }
+  try {
+    // Obtener SHA actual del archivo (necesario para actualizarlo)
+    const getMeta = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/contents/state.json`, {
+      headers: { 'Authorization': `Bearer ${GITHUB_TOKEN}`, 'Accept': 'application/vnd.github+json', 'User-Agent': 'zxmoto' },
+    });
+    const meta = getMeta.ok ? await getMeta.json() : null;
+
+    const body = {
+      message: 'chore: update heartbeat state',
+      content: Buffer.from(JSON.stringify(state, null, 2)).toString('base64'),
+      ...(meta?.sha ? { sha: meta.sha } : {}),
+    };
+
+    const put = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/contents/state.json`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${GITHUB_TOKEN}`,
+        'Accept':        'application/vnd.github+json',
+        'Content-Type':  'application/json',
+        'User-Agent':    'zxmoto',
+      },
+      body: JSON.stringify(body),
+    });
+    const result = await put.json();
+    if (put.ok) console.log('Estado guardado en repo (state.json)');
+    else console.error('Error guardando estado:', result.message);
+  } catch (e) {
+    console.error('Error writeState:', e.message);
+  }
+}
+
+// ─── Descarga y análisis de la web ────────────────────────────────────────────
 async function fetchPage(url) {
   const res = await fetch(url, {
     headers: {
@@ -43,7 +102,7 @@ function analyzeHTML(html, mainText) {
   const signals   = [];
   const closedKws = [];
 
-  // 1. Formularios con campos de pago reales (no scripts externos)
+  // 1. Formularios con campos de pago reales
   const forms = [...html.matchAll(/<form[\s\S]*?<\/form>/gi)].map(m => m[0].toLowerCase());
   for (const form of forms) {
     if (form.includes('card') || form.includes('cvv') || form.includes('iban') ||
@@ -53,7 +112,7 @@ function analyzeHTML(html, mainText) {
     }
   }
 
-  // 2. Iframes de pasarela de pago embebida
+  // 2. Iframes de pasarela de pago
   const iframes = [...html.matchAll(/<iframe[^>]*>/gi)].map(m => m[0]);
   for (const iframe of iframes) {
     const src = (iframe.match(/src=["']([^"']*)/i)?.[1] || '').toLowerCase();
@@ -64,7 +123,7 @@ function analyzeHTML(html, mainText) {
     }
   }
 
-  // 3. Texto de reserva/compra en el cuerpo (nav ya eliminado)
+  // 3. Texto de acción de reserva/compra en el cuerpo (nav ya eliminado)
   const reservaKws = [
     'reservar ahora', 'hacer reserva', 'realizar reserva', 'reservar ya',
     'comprar ahora', 'anadir al carrito', 'add to cart', 'pedir ahora',
@@ -74,21 +133,21 @@ function analyzeHTML(html, mainText) {
     if (mainText.includes(kw)) signals.push(`Texto de reserva: "${kw}"`);
   }
 
-  // 4. Precios reales en euros (> 500 EUR)
+  // 4. Precios reales en euros (>500€)
   const priceMatches = mainText.match(/\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?\s*€/g) || [];
   const realPrices = priceMatches.filter(p =>
     parseFloat(p.replace(/[€.,\s]/g, '').replace(',', '.')) > 500
   );
   if (realPrices.length > 0) signals.push(`Precios detectados: ${realPrices.slice(0, 3).join(', ')}`);
 
-  // 5. Links a tienda/reserva en el HTML
+  // 5. Links a tienda/reserva
   const shopHrefKws = ['/reserv', '/comprar', '/tienda', '/shop', '/cart', '/checkout', '/pedido'];
   const linkMatches = [...html.matchAll(/href=["']([^"']*)/gi)].map(m => m[1].toLowerCase());
   for (const href of linkMatches) {
     if (shopHrefKws.some(kw => href.includes(kw))) { signals.push(`Link tienda: ${href}`); break; }
   }
 
-  // 6. Indicadores de que sigue cerrado
+  // 6. Indicadores de cierre
   const closedList = [
     'proximamente', 'coming soon', 'en breve', 'stay tuned',
     'pronto disponible', 'available soon', 'launching soon',
@@ -101,38 +160,37 @@ function analyzeHTML(html, mainText) {
   return { isOpen, isPossible, signals, closedKws };
 }
 
-async function sendTelegram(text) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) { console.log('Sin credenciales Telegram.'); return; }
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' }),
-  });
-  const json = await res.json();
-  if (json.ok) console.log('Telegram enviado OK');
-  else console.error('Error Telegram:', json.description);
-}
-
+// ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
-  const now    = new Date().toLocaleString('es-ES', { timeZone: 'Europe/Madrid' });
-  const nowUTC = `${utcH}:${String(utcM).padStart(2,'0')} UTC`;
-  console.log(`\nZxmoto 500RR Monitor — ${now} (${nowUTC})`);
-  console.log(`Heartbeat: ${IS_HEARTBEAT} (hora UTC ${utcH} es ${utcH%2===0?'par':'impar'}, minuto ${utcM})`);
+  const now    = new Date();
+  const nowStr = now.toLocaleString('es-ES', { timeZone: 'Europe/Madrid' });
+  console.log(`\nZxmoto 500RR Monitor v4 — ${nowStr}`);
+  console.log(`Repo: ${GITHUB_REPO}`);
+
+  // Leer estado guardado para saber cuándo fue el último heartbeat
+  const state = await readState();
+  const msSinceLastHB = now.getTime() - (state.lastHeartbeat || 0);
+  const hSinceLastHB  = (msSinceLastHB / 3600000).toFixed(1);
+  const needsHeartbeat = msSinceLastHB >= HEARTBEAT_INTERVAL_MS;
+
+  console.log(`Ultimo heartbeat: hace ${hSinceLastHB}h → ${needsHeartbeat ? 'ENVIAR' : 'no necesario aun'}`);
   console.log(`Comprobando: ${TARGET_URL}\n`);
 
+  // Descargar y analizar la web
   let html, mainText;
   try {
     html     = await fetchPage(TARGET_URL);
     mainText = extractMainText(html);
   } catch (err) {
-    console.error(`Error al descargar: ${err.message}`);
-    if (IS_HEARTBEAT) {
+    console.error(`Error descargando: ${err.message}`);
+    if (needsHeartbeat) {
       await sendTelegram(
         `⚠️ <b>Zxmoto Monitor — Error de conexion</b>\n\n` +
-        `No se pudo acceder a zxmoto.es\n` +
+        `No pude acceder a zxmoto.es\n` +
         `Error: ${err.message}\n\n` +
-        `Se seguira intentando. ⏰ ${now}`
+        `Sigo intentando. ⏰ ${nowStr}`
       );
+      await writeState({ ...state, lastHeartbeat: now.getTime() });
     }
     process.exit(0);
   }
@@ -151,31 +209,36 @@ async function main() {
       `🏍️ <b>ZXMOTO 500RR — RESERVAS ABIERTAS!</b>\n\n` +
       `Senales detectadas:\n${signalList}\n\n` +
       `🔗 <a href="https://zxmoto.es/">VE A ZXMOTO.ES AHORA</a>\n\n` +
-      `Detectado: ${now}`
+      `Detectado: ${nowStr}`
     );
 
   } else if (result.isPossible) {
-    console.log('\nSenales mixtas — posible cambio parcial');
+    console.log('\nSenales mixtas');
     await sendTelegram(
       `⚠️ <b>Zxmoto 500RR — Cambio detectado (revisar)</b>\n\n` +
       `Senales: ${result.signals.join(', ')}\n` +
       `Pero sigue con: ${result.closedKws.join(', ')}\n\n` +
-      `🔗 <a href="https://zxmoto.es/">zxmoto.es</a>\n\n${now}`
+      `🔗 <a href="https://zxmoto.es/">zxmoto.es</a>\n\n${nowStr}`
     );
 
   } else {
-    // Sin reservas — enviar Telegram solo si es heartbeat
-    console.log('\nEstado: SIN RESERVAS todavia. Normal.');
-    if (IS_HEARTBEAT) {
-      console.log('-> Enviando heartbeat (hora UTC par)');
-      await sendTelegram(
+    // Sin reservas — heartbeat si toca
+    console.log('\nEstado: SIN RESERVAS todavia.');
+    if (needsHeartbeat) {
+      console.log('-> Enviando heartbeat (han pasado ' + hSinceLastHB + 'h)');
+      const sent = await sendTelegram(
         `🏍️ <b>Zxmoto Monitor — Todo OK</b>\n\n` +
         `✅ Sigo vigilando zxmoto.es\n` +
         `📋 Estado: <b>Sin reservas todavia</b>\n` +
         `🔒 La web sigue en modo proximamente\n\n` +
         `Te aviso en cuanto haya algo 💪\n\n` +
-        `⏰ ${now}`
+        `⏰ ${nowStr}`
       );
+      if (sent) {
+        await writeState({ ...state, lastHeartbeat: now.getTime(), lastCheck: now.getTime() });
+      }
+    } else {
+      console.log(`-> Proximo heartbeat en aprox. ${(2 - msSinceLastHB/3600000).toFixed(1)}h`);
     }
   }
 }
